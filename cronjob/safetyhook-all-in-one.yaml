@@ -1,0 +1,183 @@
+# ============================================================================
+# Safety-Net Hook Manager - All-in-One
+#
+# Usage: oc apply -f safetyhook-all-in-one.yaml
+# ============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: velero-hook-manager
+  namespace: openshift-cnv
+  labels:
+    app.kubernetes.io/component: kubevirt-freeze-safetyhook
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: velero-hook-manager
+  labels:
+    app.kubernetes.io/component: kubevirt-freeze-safetyhook
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "patch"]
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: velero-hook-manager
+  labels:
+    app.kubernetes.io/component: kubevirt-freeze-safetyhook
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: velero-hook-manager
+subjects:
+- kind: ServiceAccount
+  name: velero-hook-manager
+  namespace: openshift-cnv
+---
+# Equivalent to: oc adm policy add-scc-to-user privileged system:serviceaccount:openshift-cnv:velero-hook-manager
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: velero-hook-manager-scc-privileged
+  labels:
+    app.kubernetes.io/component: kubevirt-freeze-safetyhook
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:openshift:scc:privileged
+subjects:
+- kind: ServiceAccount
+  name: velero-hook-manager
+  namespace: openshift-cnv
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: safetyhook-db
+  namespace: openshift-cnv
+  labels:
+    app.kubernetes.io/component: kubevirt-freeze-safetyhook
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 120
+      template:
+        spec:
+          serviceAccountName: velero-hook-manager
+          restartPolicy: OnFailure
+          containers:
+          - name: safetyhook
+            image: registry.redhat.io/openshift4/ose-cli:latest
+            env:
+            - name: UNFREEZE_TIMEOUT
+              value: "120"
+            - name: FREEZE_TIMEOUT
+              value: "45"
+            - name: NS_LABEL_SELECTOR
+              # Leave empty for auto-discovery of all namespaces with VMs (default).
+              # Set to filter namespaces by label, e.g.: "ambiente=virtualizacao"
+              value: ""
+            command:
+            - /bin/sh
+            - -c
+            - |
+              echo "=== Safety-net hook manager ==="
+              echo "Started: $(date -u)"
+              echo ""
+
+              # Discover namespaces: by label selector or auto-discovery
+              if [ -n "${NS_LABEL_SELECTOR}" ]; then
+                echo "Mode: label selector (${NS_LABEL_SELECTOR})"
+                NAMESPACES=$(oc get namespaces -l "${NS_LABEL_SELECTOR}" \
+                  --no-headers -o custom-columns=NS:.metadata.name 2>/dev/null)
+              else
+                echo "Mode: auto-discovery (all namespaces with VMs)"
+                NAMESPACES=$(oc get pods --all-namespaces -l kubevirt.io=virt-launcher \
+                  --no-headers -o custom-columns=NS:.metadata.namespace 2>/dev/null | sort -u)
+              fi
+
+              if [ -z "${NAMESPACES}" ]; then
+                echo "No namespaces found."
+                exit 0
+              fi
+
+              echo "Discovered namespaces: $(echo ${NAMESPACES} | tr '\n' ' ')"
+              echo ""
+
+              for NS in ${NAMESPACES}; do
+                # Check exclusion label
+                EXCLUDE=$(oc get namespace ${NS} \
+                  -o jsonpath='{.metadata.labels.backup-safetyhook-exclude}' 2>/dev/null)
+                if [ "${EXCLUDE}" = "true" ]; then
+                  echo "=== Skipping namespace: ${NS} (excluded) ==="
+                  echo ""
+                  continue
+                fi
+
+                echo "=== Processing namespace: ${NS} ==="
+                PODS=$(oc get pods -n ${NS} -l kubevirt.io=virt-launcher \
+                  --field-selector=status.phase=Running \
+                  -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+
+                for POD in ${PODS}; do
+                  # Check if safety-net already applied
+                  CURRENT_HOOK=$(oc get pod ${POD} -n ${NS} \
+                    -o jsonpath='{.metadata.annotations.pre\.hook\.backup\.velero\.io/command}' 2>/dev/null)
+
+                  if echo "${CURRENT_HOOK}" | grep -q "unfreezeTimeoutSeconds"; then
+                    echo "  Already protected: ${POD}"
+                    continue
+                  fi
+
+                  # Check if original hook exists
+                  if [ -z "${CURRENT_HOOK}" ]; then
+                    echo "  No hook found: ${POD}"
+                    continue
+                  fi
+
+                  # Extract VM name from label
+                  VM_NAME=$(oc get pod ${POD} -n ${NS} \
+                    -o jsonpath='{.metadata.labels.vm\.kubevirt\.io/name}' 2>/dev/null)
+
+                  if [ -z "${VM_NAME}" ]; then
+                    echo "  ERROR: could not extract VM name from: ${POD}"
+                    continue
+                  fi
+
+                  echo "  Applying safety-net: ${POD} (VM: ${VM_NAME})"
+
+                  # Pre-hook: freeze with safety-net
+                  PRE_CMD="[\"\/bin\/sh\", \"-c\", \"timeout ${FREEZE_TIMEOUT} \/usr\/bin\/virt-freezer --freeze --name ${VM_NAME} --namespace ${NS} --unfreezeTimeoutSeconds ${UNFREEZE_TIMEOUT} || \/usr\/bin\/virt-freezer --unfreeze --name ${VM_NAME} --namespace ${NS} 2>\/dev\/null; exit 0\"]"
+
+                  # Post-hook: robust unfreeze
+                  POST_CMD="[\"\/bin\/sh\", \"-c\", \"\/usr\/bin\/virt-freezer --unfreeze --name ${VM_NAME} --namespace ${NS} 2>\/dev\/null; exit 0\"]"
+
+                  oc annotate pod ${POD} -n ${NS} --overwrite \
+                    "pre.hook.backup.velero.io/command=${PRE_CMD}" \
+                    "pre.hook.backup.velero.io/container=compute" \
+                    "pre.hook.backup.velero.io/timeout=180s" \
+                    "pre.hook.backup.velero.io/on-error=Continue" \
+                    "post.hook.backup.velero.io/command=${POST_CMD}" \
+                    "post.hook.backup.velero.io/container=compute" \
+                    "post.hook.backup.velero.io/timeout=60s" \
+                    "post.hook.backup.velero.io/on-error=Continue"
+
+                  if [ $? -eq 0 ]; then
+                    echo "  OK: ${POD}"
+                  else
+                    echo "  ERROR annotating: ${POD}"
+                  fi
+                done
+                echo ""
+              done
+              echo "=== Completed: $(date -u) ==="

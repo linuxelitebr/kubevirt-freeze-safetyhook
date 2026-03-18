@@ -1,0 +1,141 @@
+apiVersion: loki.grafana.com/v1
+kind: AlertingRule
+metadata:
+  name: hitachi-backup-alerts
+  namespace: backup-netbackup
+  labels:
+    openshift.io/cluster-monitoring: "true"
+spec:
+  tenantID: "application"
+  groups:
+
+  - name: hitachi.storage.errors
+    interval: 2m
+    rules:
+
+    # ----------------------------------------------------------------
+    # Alert 1 — Any error returned by the Hitachi VSP storage system
+    # Covers exhausted LDEV IDs, full DP pool, snapshot limit reached,
+    # and any other storage-side failure.
+    # Fires immediately (for: 0m) — no confirmation wait.
+    # ----------------------------------------------------------------
+    - alert: HitachiStorageError
+      expr: |
+        sum(
+          count_over_time(
+            {log_type="application", kubernetes_namespace_name="backup-netbackup"}
+            |= "An error occurred in the storage system"
+            [5m]
+          )
+        ) > 0
+      for: 0m
+      labels:
+        severity: critical
+        team: storage
+        namespace: backup-netbackup
+      annotations:
+        summary: "Hitachi VSP — storage system error"
+        description: >
+          The Hitachi VSP storage system returned an error during a snapshot
+          operation. Possible causes: exhausted LDEV IDs in the resource group
+          (SSB1 2E11), full DP pool, or Thin Image pairs limit reached.
+          IMMEDIATE ACTION: check LDEV ID pool availability in the VSP
+          Storage Navigator.
+          VMs in namespace n3-antimalware-sp may have their filesystem frozen
+          (virt-freezer active) while the backup waits for the snapshot.
+
+    # ----------------------------------------------------------------
+    # Alert 2 — Specific LDEV ID exhaustion error (KART30000-E)
+    # More specific than Alert 1, useful for Zabbix correlation.
+    # ----------------------------------------------------------------
+    - alert: HitachiLDEVExhausted
+      expr: |
+        sum(
+          count_over_time(
+            {log_type="application", kubernetes_namespace_name="backup-netbackup"}
+            |= "no available LDEV ID in the system or resource groups"
+            [5m]
+          )
+        ) > 0
+      for: 0m
+      labels:
+        severity: critical
+        team: storage
+        namespace: backup-netbackup
+      annotations:
+        summary: "Hitachi VSP — LDEV IDs exhausted (KART30000-E)"
+        description: >
+          Hitachi VSP returned KART30000-E: no LDEV ID available in the
+          resource group. Backup snapshots are failing.
+          Free up LDEV IDs in the Storage Navigator.
+          Reference: SSB1 [2E11] SSB2 [2209].
+
+    # ----------------------------------------------------------------
+    # Alert 3 — Backup controller snapshot timeout
+    # Indicates VMs were left with an active freeze for ~15 minutes.
+    # Fires after 1 minute of persistence to avoid log-rotation
+    # false positives.
+    # ----------------------------------------------------------------
+    - alert: NetBackupSnapshotTimeout
+      expr: |
+        sum(
+          count_over_time(
+            {log_type="application", kubernetes_namespace_name="backup-netbackup"}
+            |= "timed out waiting for the condition"
+            [5m]
+          )
+        ) > 0
+      for: 1m
+      labels:
+        severity: critical
+        team: backup
+        namespace: backup-netbackup
+      annotations:
+        summary: "NetBackup — snapshot timeout waiting for Hitachi VSP"
+        description: >
+          The NetBackup controller hit the 15-minute timeout waiting for a
+          Hitachi VSP snapshot. The backup job has failed.
+          CHECK IMMEDIATELY: VMs in namespace n3-antimalware-sp may still
+          have virt-freezer --freeze active without a corresponding unfreeze.
+          Do NOT restart or shut down any VM without first investigating the
+          freeze state — forced shutdown of a frozen VM can cause a BSOD
+          (stop code 0x0000001A / MEMORY_MANAGEMENT).
+
+    # ----------------------------------------------------------------
+    # Alert 4 — Pre/post hook imbalance (freeze without unfreeze)
+    # Detects an active freeze BEFORE the timeout fires — early warning
+    # to protect VMs before the situation becomes critical.
+    # Tolerance of 5 avoids false positives during normal backup flow.
+    # ----------------------------------------------------------------
+    - alert: VirtFreezerActiveWithoutUnfreeze
+      expr: |
+        (
+          sum(count_over_time(
+            {log_type="application", kubernetes_namespace_name="backup-netbackup"}
+            |= "Phase netbackup-pre"
+            [30m]
+          ))
+          -
+          sum(count_over_time(
+            {log_type="application", kubernetes_namespace_name="backup-netbackup"}
+            |= "Phase netbackup-post"
+            [30m]
+          ))
+        ) > 5
+      for: 10m
+      labels:
+        severity: warning
+        team: backup
+        namespace: backup-netbackup
+      annotations:
+        summary: "Possible VMs with frozen filesystem (virt-freezer active)"
+        description: >
+          The number of pre-backup hooks significantly exceeds post-backup
+          hooks over the last 20 minutes. This may indicate that
+          virt-freezer --freeze is active without a corresponding unfreeze
+          on VMs in namespace n3-antimalware-sp.
+          Do NOT restart or shut down affected VMs without first confirming
+          the freeze state — forced shutdown of a frozen VM can cause a BSOD
+          (stop code 0x0000001A / MEMORY_MANAGEMENT).
+          Verify whether a backup job is currently running before taking
+          any action.

@@ -1,0 +1,65 @@
+# Replaces Velero freeze/unfreeze hooks with safety-net versions at pod creation.
+# The freeze still happens (application-consistent), but with automatic unfreeze
+# after 120 seconds if the post-hook never runs.
+#
+# NAMESPACE TARGETING:
+# By default, this policy uses a namespaceSelector. Label your namespaces with:
+#   oc label namespace <ns> backup-safetyhook=enabled
+#
+# Alternatively, replace namespaceSelector with a static list:
+#   namespaces:
+#   - namespace-01
+#   - namespace-02
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: safetyhook-db-admission
+  labels:
+    app.kubernetes.io/component: kubevirt-freeze-safetyhook
+  annotations:
+    policies.kyverno.io/title: Safety-Net Freeze Hooks (Admission)
+    policies.kyverno.io/category: Workload Safety
+    pod-policies.kyverno.io/autogen-controllers: none
+spec:
+  background: false
+  rules:
+  - name: replace-freeze-hooks
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+          namespaceSelector:
+            matchLabels:
+              backup-safetyhook: enabled
+          selector:
+            matchLabels:
+              kubevirt.io: virt-launcher
+    preconditions:
+      all:
+      - key: "{{ request.object.metadata.annotations.\"pre.hook.backup.velero.io/command\" || '' }}"
+        operator: NotEquals
+        value: ""
+    context:
+    - name: vmName
+      variable:
+        jmesPath: request.object.metadata.labels."vm.kubevirt.io/name"
+    - name: vmNamespace
+      variable:
+        jmesPath: request.object.metadata.namespace
+    mutate:
+      patchStrategicMerge:
+        metadata:
+          annotations:
+            pre.hook.backup.velero.io/command: >-
+              ["/bin/sh", "-c",
+              "timeout 45 /usr/bin/virt-freezer --freeze --name {{ vmName }} --namespace {{ vmNamespace }} --unfreezeTimeoutSeconds 120 || /usr/bin/virt-freezer --unfreeze --name {{ vmName }} --namespace {{ vmNamespace }} 2>/dev/null; exit 0"]
+            pre.hook.backup.velero.io/container: "compute"
+            pre.hook.backup.velero.io/timeout: "180s"
+            pre.hook.backup.velero.io/on-error: "Continue"
+            post.hook.backup.velero.io/command: >-
+              ["/bin/sh", "-c",
+              "/usr/bin/virt-freezer --unfreeze --name {{ vmName }} --namespace {{ vmNamespace }} 2>/dev/null; exit 0"]
+            post.hook.backup.velero.io/container: "compute"
+            post.hook.backup.velero.io/timeout: "60s"
+            post.hook.backup.velero.io/on-error: "Continue"

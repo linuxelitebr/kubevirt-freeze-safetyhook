@@ -1,0 +1,48 @@
+# Adds timeout and on-error to existing virt-launcher pods.
+# The full safety-net (unfreezeTimeoutSeconds) is applied by the admission
+# policy on next VM restart. This policy ensures existing pods at least
+# have the timeout and Continue fallback.
+#
+# NAMESPACE TARGETING:
+# Uses namespaceSelector by default. Label your namespaces with:
+#   oc label namespace <ns> backup-safetyhook=enabled
+#
+# NOTE: The targets[] section requires explicit namespaces (namespaceSelector
+# is not supported there). Add each namespace you want to protect.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: safetyhook-db-reconcile
+  labels:
+    app.kubernetes.io/component: kubevirt-freeze-safetyhook
+  annotations:
+    pod-policies.kyverno.io/autogen-controllers: none
+spec:
+  mutateExistingOnPolicyUpdate: true
+  rules:
+  - name: add-timeout-and-continue
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+          namespaceSelector:
+            matchLabels:
+              backup-safetyhook: enabled
+          selector:
+            matchLabels:
+              kubevirt.io: virt-launcher
+    mutate:
+      targets:
+      # ADD one entry per namespace you want to protect.
+      # namespaceSelector is not supported in targets[].
+      - apiVersion: v1
+        kind: Pod
+        namespace: your-vm-namespace
+      patchStrategicMerge:
+        metadata:
+          annotations:
+            pre.hook.backup.velero.io/timeout: "180s"
+            pre.hook.backup.velero.io/on-error: "Continue"
+            post.hook.backup.velero.io/timeout: "60s"
+            post.hook.backup.velero.io/on-error: "Continue"

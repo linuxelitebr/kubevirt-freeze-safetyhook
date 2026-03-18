@@ -1,0 +1,75 @@
+apiVersion: monitoring.coreos.com/v1beta1
+kind: AlertmanagerConfig
+metadata:
+  name: backup-storage-routing
+  namespace: backup-netbackup
+spec:
+  route:
+    receiver: storage-oncall
+    # Group alerts of the same type to avoid notification storms
+    groupBy: ["alertname", "namespace"]
+    groupWait: 30s
+    groupInterval: 5m
+    # Re-notify every hour while the problem persists
+    repeatInterval: 1h
+    # Severity-based sub-routing
+    routes:
+    - receiver: storage-oncall
+      matchers:
+      - name: severity
+        value: critical
+      groupWait: 10s       # critical alerts fire faster
+      repeatInterval: 30m  # and repeat more frequently
+    - receiver: storage-warning
+      matchers:
+      - name: severity
+        value: warning
+
+  receivers:
+
+  # ----------------------------------------------------------------
+  # Primary receiver - critical alerts (storage errors and active freeze)
+  # Configure one or more of the channels below depending on what
+  # the team already uses. Uncomment and fill in as needed.
+  # ----------------------------------------------------------------
+  - name: storage-oncall
+
+    # --- EMAIL ---
+    emailConfigs:
+    - to: "storage-team@company.com, backup-team@company.com"
+      from: "openshift-alerts@company.com"
+      smarthost: "smtp.company.com:587"
+      requireTLS: true
+      headers:
+        subject: '[CRITICAL] {{ .GroupLabels.alertname }} - OpenShift/Hitachi'
+
+    # --- GENERIC WEBHOOK (Teams, Slack via webhook, etc.) ---
+    # webhookConfigs:
+    # - url: "https://outlook.office.com/webhook/..."
+    #   sendResolved: true
+
+    # --- SLACK ---
+    # slackConfigs:
+    # - apiURL: "https://hooks.slack.com/services/..."
+    #   channel: "#ops-storage-alerts"
+    #   title: '[{{ .Status | toUpper }}] {{ .GroupLabels.alertname }}'
+    #   text: '{{ range .Alerts }}{{ .Annotations.description }}{{ end }}'
+    #   sendResolved: true
+
+    # --- PAGERDUTY ---
+    # pagerdutyConfigs:
+    # - routingKey: "<integration-key>"
+    #   description: '{{ .GroupLabels.alertname }}: {{ .CommonAnnotations.summary }}'
+
+  # ----------------------------------------------------------------
+  # Secondary receiver - warnings (early freeze detection)
+  # ----------------------------------------------------------------
+  - name: storage-warning
+
+    emailConfigs:
+    - to: "backup-team@company.com"
+      from: "openshift-alerts@company.com"
+      smarthost: "smtp.company.com:587"
+      requireTLS: true
+      headers:
+        subject: '[WARNING] {{ .GroupLabels.alertname }} - OpenShift/Hitachi'
