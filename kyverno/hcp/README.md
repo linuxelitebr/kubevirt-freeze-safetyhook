@@ -67,7 +67,7 @@ helm install kyverno kyverno/kyverno \
   --namespace kyverno \
   --set admissionController.replicas=3 \
   --set admissionController.rbac.create=true \
-  --set admissionController.container.image.pullPolicy=Always \
+  --set admissionController.container.image.pullPolicy=IfNotPresent \
   --set admissionController.certManager.enabled=false \
   --set admissionController.service.port=9443 \
   --set features.admissionWebhookCEL.enabled=false \
