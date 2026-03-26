@@ -2,12 +2,35 @@
 # Safety-Net Hook Manager - All-in-One
 #
 # Usage: oc apply -f safetyhook-all-in-one.yaml
+#
+# Contains:
+#   - Namespace: safetyhook-monitor
+#   - ServiceAccounts + RBAC + SCC
+#   - ConfigMap: freeze-state (state between monitor executions)
+#   - CronJob: safetyhook-db (every 5 min) - applies safety-net annotations
+#   - CronJob: safetyhook-monitor (every 1 min) - monitors freeze state
 # ============================================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: safetyhook-monitor
+  labels:
+    app.kubernetes.io/component: kubevirt-freeze-safetyhook
+---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: velero-hook-manager
   namespace: openshift-cnv
+  labels:
+    app.kubernetes.io/component: kubevirt-freeze-safetyhook
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: safetyhook-monitor
+  namespace: safetyhook-monitor
   labels:
     app.kubernetes.io/component: kubevirt-freeze-safetyhook
 ---
@@ -26,6 +49,56 @@ rules:
   verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: safetyhook-monitor
+  labels:
+    app.kubernetes.io/component: kubevirt-freeze-safetyhook
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["get", "list"]
+- apiGroups: ["kubevirt.io"]
+  resources: ["virtualmachineinstances"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "create", "update", "patch"]
+  resourceNames: ["freeze-state"]
+---
+# Extra rule to allow creating the configmap if it does not exist
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: safetyhook-monitor-cm
+  namespace: safetyhook-monitor
+  labels:
+    app.kubernetes.io/component: kubevirt-freeze-safetyhook
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: safetyhook-monitor-cm
+  namespace: safetyhook-monitor
+  labels:
+    app.kubernetes.io/component: kubevirt-freeze-safetyhook
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: safetyhook-monitor-cm
+subjects:
+- kind: ServiceAccount
+  name: safetyhook-monitor
+  namespace: safetyhook-monitor
+---
+apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
   name: velero-hook-manager
@@ -40,7 +113,21 @@ subjects:
   name: velero-hook-manager
   namespace: openshift-cnv
 ---
-# Equivalent to: oc adm policy add-scc-to-user privileged system:serviceaccount:openshift-cnv:velero-hook-manager
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: safetyhook-monitor
+  labels:
+    app.kubernetes.io/component: kubevirt-freeze-safetyhook
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: safetyhook-monitor
+subjects:
+- kind: ServiceAccount
+  name: safetyhook-monitor
+  namespace: safetyhook-monitor
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
@@ -56,6 +143,20 @@ subjects:
   name: velero-hook-manager
   namespace: openshift-cnv
 ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: freeze-state
+  namespace: safetyhook-monitor
+  labels:
+    app.kubernetes.io/component: kubevirt-freeze-safetyhook
+data:
+  frozen-vms: ""
+---
+# ============================================================================
+# CronJob 1: Safety-net hook applicator (every 5 minutes)
+# Namespace: openshift-cnv
+# ============================================================================
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -84,8 +185,6 @@ spec:
             - name: FREEZE_TIMEOUT
               value: "45"
             - name: NS_LABEL_SELECTOR
-              # Leave empty for auto-discovery of all namespaces with VMs (default).
-              # Set to filter namespaces by label, e.g.: "ambiente=virtualizacao"
               value: ""
             command:
             - /bin/sh
@@ -95,7 +194,6 @@ spec:
               echo "Started: $(date -u)"
               echo ""
 
-              # Discover namespaces: by label selector or auto-discovery
               if [ -n "${NS_LABEL_SELECTOR}" ]; then
                 echo "Mode: label selector (${NS_LABEL_SELECTOR})"
                 NAMESPACES=$(oc get namespaces -l "${NS_LABEL_SELECTOR}" \
@@ -115,7 +213,6 @@ spec:
               echo ""
 
               for NS in ${NAMESPACES}; do
-                # Check exclusion label
                 EXCLUDE=$(oc get namespace ${NS} \
                   -o jsonpath='{.metadata.labels.backup-safetyhook-exclude}' 2>/dev/null)
                 if [ "${EXCLUDE}" = "true" ]; then
@@ -130,7 +227,6 @@ spec:
                   -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
 
                 for POD in ${PODS}; do
-                  # Check if safety-net already applied
                   CURRENT_HOOK=$(oc get pod ${POD} -n ${NS} \
                     -o jsonpath='{.metadata.annotations.pre\.hook\.backup\.velero\.io/command}' 2>/dev/null)
 
@@ -139,13 +235,11 @@ spec:
                     continue
                   fi
 
-                  # Check if original hook exists
                   if [ -z "${CURRENT_HOOK}" ]; then
                     echo "  No hook found: ${POD}"
                     continue
                   fi
 
-                  # Extract VM name from label
                   VM_NAME=$(oc get pod ${POD} -n ${NS} \
                     -o jsonpath='{.metadata.labels.vm\.kubevirt\.io/name}' 2>/dev/null)
 
@@ -156,11 +250,9 @@ spec:
 
                   echo "  Applying safety-net: ${POD} (VM: ${VM_NAME})"
 
-                  # Pre-hook: freeze with safety-net
-                  PRE_CMD="[\"\/bin\/sh\", \"-c\", \"timeout ${FREEZE_TIMEOUT} \/usr\/bin\/virt-freezer --freeze --name ${VM_NAME} --namespace ${NS} --unfreezeTimeoutSeconds ${UNFREEZE_TIMEOUT} || \/usr\/bin\/virt-freezer --unfreeze --name ${VM_NAME} --namespace ${NS} 2>\/dev\/null; exit 0\"]"
+                  PRE_CMD="[\"\/bin\/sh\", \"-c\", \"timeout ${FREEZE_TIMEOUT} \/usr\/bin\/virt-freezer --freeze --name ${VM_NAME} --namespace ${NS} --unfreezeTimeoutSeconds ${UNFREEZE_TIMEOUT} || (echo SAFETYHOOK-EMERGENCY: freeze failed or timed out, forcing unfreeze for VM ${VM_NAME} in ${NS}; \/usr\/bin\/virt-freezer --unfreeze --name ${VM_NAME} --namespace ${NS} 2>\/dev\/null); exit 0\"]"
 
-                  # Post-hook: robust unfreeze
-                  POST_CMD="[\"\/bin\/sh\", \"-c\", \"\/usr\/bin\/virt-freezer --unfreeze --name ${VM_NAME} --namespace ${NS} 2>\/dev\/null; exit 0\"]"
+                  POST_CMD="[\"\/bin\/sh\", \"-c\", \"echo SAFETYHOOK: post-hook unfreeze for VM ${VM_NAME} in ${NS}; \/usr\/bin\/virt-freezer --unfreeze --name ${VM_NAME} --namespace ${NS} 2>\/dev\/null; exit 0\"]"
 
                   oc annotate pod ${POD} -n ${NS} --overwrite \
                     "pre.hook.backup.velero.io/command=${PRE_CMD}" \
@@ -181,3 +273,111 @@ spec:
                 echo ""
               done
               echo "=== Completed: $(date -u) ==="
+---
+# ============================================================================
+# CronJob 2: Freeze state monitor (every 1 minute)
+# Namespace: safetyhook-monitor (logs go to Loki tenant application)
+#
+# Only logs on state transitions:
+#   SAFETYHOOK-MONITOR: FROZEN    - VM just entered frozen state
+#   SAFETYHOOK-MONITOR: RECOVERED - VM just returned to normal (auto-unfreeze worked)
+#
+# Zero logs when all VMs are healthy.
+#
+# Loki queries:
+#   { log_type="application" } |= "SAFETYHOOK-MONITOR: FROZEN"
+#   { log_type="application" } |= "SAFETYHOOK-MONITOR: RECOVERED"
+#   { log_type="application" } |= "SAFETYHOOK-MONITOR"
+# ============================================================================
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: safetyhook-monitor
+  namespace: safetyhook-monitor
+  labels:
+    app.kubernetes.io/component: kubevirt-freeze-safetyhook
+spec:
+  schedule: "*/2 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 55
+      template:
+        spec:
+          serviceAccountName: safetyhook-monitor
+          restartPolicy: OnFailure
+          containers:
+          - name: monitor
+            image: registry.redhat.io/openshift4/ose-cli:latest
+            env:
+            - name: NS_LABEL_SELECTOR
+              value: ""
+            command:
+            - /bin/sh
+            - -c
+            - |
+              CM_NS="safetyhook-monitor"
+              CM_NAME="freeze-state"
+              NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+              # Read previous state from ConfigMap
+              PREV_FROZEN=$(oc get configmap ${CM_NAME} -n ${CM_NS} \
+                -o jsonpath='{.data.frozen-vms}' 2>/dev/null || echo "")
+
+              # Discover namespaces
+              if [ -n "${NS_LABEL_SELECTOR}" ]; then
+                NAMESPACES=$(oc get namespaces -l "${NS_LABEL_SELECTOR}" \
+                  --no-headers -o custom-columns=NS:.metadata.name 2>/dev/null)
+              else
+                NAMESPACES=$(oc get pods --all-namespaces -l kubevirt.io=virt-launcher \
+                  --field-selector=status.phase=Running \
+                  --no-headers -o custom-columns=NS:.metadata.namespace 2>/dev/null | sort -u)
+              fi
+
+              CURRENT_FROZEN=""
+
+              for NS in ${NAMESPACES}; do
+                EXCLUDE=$(oc get namespace ${NS} \
+                  -o jsonpath='{.metadata.labels.backup-safetyhook-exclude}' 2>/dev/null)
+                [ "${EXCLUDE}" = "true" ] && continue
+
+                for VM in $(oc get vmi -n ${NS} --no-headers -o custom-columns=NAME:.metadata.name 2>/dev/null); do
+                  STATUS=$(oc get vmi ${VM} -n ${NS} -o jsonpath='{.status.fsFreezeStatus}' 2>/dev/null)
+
+                  if [ "${STATUS}" = "frozen" ]; then
+                    KEY="${NS}/${VM}"
+
+                    # Add to current frozen list
+                    if [ -z "${CURRENT_FROZEN}" ]; then
+                      CURRENT_FROZEN="${KEY}"
+                    else
+                      CURRENT_FROZEN="${CURRENT_FROZEN},${KEY}"
+                    fi
+
+                    # Check if this is a new freeze (not in previous state)
+                    if ! echo ",${PREV_FROZEN}," | grep -q ",${KEY},"; then
+                      echo "SAFETYHOOK-MONITOR: FROZEN vm=${VM} namespace=${NS} timestamp=${NOW}"
+                    fi
+                  fi
+                done
+              done
+
+              # Check for recovered VMs (were frozen, now unfrozen)
+              if [ -n "${PREV_FROZEN}" ]; then
+                OLD_IFS="${IFS}"
+                IFS=","
+                for KEY in ${PREV_FROZEN}; do
+                  if ! echo ",${CURRENT_FROZEN}," | grep -q ",${KEY},"; then
+                    REC_NS=$(echo "${KEY}" | cut -d'/' -f1)
+                    REC_VM=$(echo "${KEY}" | cut -d'/' -f2)
+                    echo "SAFETYHOOK-MONITOR: RECOVERED vm=${REC_VM} namespace=${REC_NS} timestamp=${NOW}"
+                  fi
+                done
+                IFS="${OLD_IFS}"
+              fi
+
+              # Update ConfigMap with current state
+              oc patch configmap ${CM_NAME} -n ${CM_NS} --type merge \
+                -p "{\"data\":{\"frozen-vms\":\"${CURRENT_FROZEN}\"}}" 2>/dev/null
