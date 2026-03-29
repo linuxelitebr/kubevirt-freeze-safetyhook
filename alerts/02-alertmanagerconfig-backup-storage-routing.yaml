@@ -41,7 +41,9 @@ spec:
       smarthost: "smtp.company.com:587"
       requireTLS: true
       headers:
-        subject: '[CRITICAL] {{ .GroupLabels.alertname }} - OpenShift/Hitachi'
+      - key: subject
+        value: '[CRITICAL] {{ .GroupLabels.alertname }} - OpenShift/Hitachi'
+
 
     # --- GENERIC WEBHOOK (Teams, Slack via webhook, etc.) ---
     # webhookConfigs:
@@ -72,4 +74,5 @@ spec:
       smarthost: "smtp.company.com:587"
       requireTLS: true
       headers:
-        subject: '[WARNING] {{ .GroupLabels.alertname }} - OpenShift/Hitachi'
+      - key: subject
+        value: '[WARNING] {{ .GroupLabels.alertname }} - OpenShift/Hitachi'
