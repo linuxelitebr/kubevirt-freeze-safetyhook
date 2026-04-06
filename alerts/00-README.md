@@ -223,8 +223,25 @@ Filter by specific namespace:
 ### CLI verification (alternative to Loki)
 
 ```bash
-# Latest monitor run
+# Find the job name for the monitor
+oc get jobs -n safetyhook-monitor
+
+# Latest monitor run - replace <job-name> with the value from the command above
+oc logs -n safetyhook-monitor -l job-name=<job-name> --tail=20
+
+# Alternatively, select all pods from any job in the namespace (no specific job-name needed)
 oc logs -n safetyhook-monitor -l job-name --tail=20
+
+# Follow logs in real time (useful during an active migration or snapshot window)
+oc logs -n safetyhook-monitor -l job-name --tail=20 -f
+
+# Filter output for errors or warnings only
+oc logs -n safetyhook-monitor -l job-name --tail=100 | grep -iE "error|warn|fail|timeout"
+
+# Check which pods are selected before reading logs
+oc get pods -n safetyhook-monitor -l job-name
+
+# The `-l job-name` option without a value is already sufficiently generic. It selects any pod created by any Job in the namespace, which is the expected behavior for a dynamically named monitor. The `oc get jobs` command is only useful for those who want to filter a specific run.
 
 # Check all VMI freeze status directly
 oc get vmi --all-namespaces -o json | jq -r '.items[] | "\(.metadata.namespace)/\(.metadata.name): \(.status.fsFreezeStatus // "unfrozen")"'

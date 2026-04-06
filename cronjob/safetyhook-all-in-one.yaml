@@ -171,14 +171,16 @@ spec:
   failedJobsHistoryLimit: 3
   jobTemplate:
     spec:
-      activeDeadlineSeconds: 120
+      activeDeadlineSeconds: 270
       template:
         spec:
           serviceAccountName: velero-hook-manager
-          restartPolicy: OnFailure
+          restartPolicy: Never
+          terminationGracePeriodSeconds: 20
           containers:
           - name: safetyhook
             image: registry.redhat.io/openshift4/ose-cli:latest
+            imagePullPolicy: IfNotPresent
             env:
             - name: UNFREEZE_TIMEOUT
               value: "120"
@@ -303,14 +305,16 @@ spec:
   failedJobsHistoryLimit: 3
   jobTemplate:
     spec:
-      activeDeadlineSeconds: 55
+      activeDeadlineSeconds: 90
       template:
         spec:
           serviceAccountName: safetyhook-monitor
-          restartPolicy: OnFailure
+          restartPolicy: Never
+          terminationGracePeriodSeconds: 15
           containers:
           - name: monitor
             image: registry.redhat.io/openshift4/ose-cli:latest
+            imagePullPolicy: IfNotPresent
             env:
             - name: NS_LABEL_SELECTOR
               value: ""
