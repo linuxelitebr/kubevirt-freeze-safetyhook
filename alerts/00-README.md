@@ -108,7 +108,6 @@ oc patch lokistack logging-loki -n openshift-logging --type=merge -p '{
 
 ```bash
 oc label namespace backup-netbackup openshift.io/cluster-monitoring=true
-oc label namespace safetyhook-monitor openshift.io/cluster-monitoring=true
 ```
 
 > These steps are only needed if not already configured. Verify with:
