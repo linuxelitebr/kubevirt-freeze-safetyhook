@@ -121,7 +121,7 @@ oc label namespace backup-netbackup openshift.io/cluster-monitoring=true
 ## Apply
 
 ```bash
-oc apply -f 01-alertingrule-hitachi-backup-alerts.yaml
+oc apply -f 01-prometheusrule-hitachi-backup-alerts.yaml
 oc apply -f 02-alertmanagerconfig-backup-storage-routing.yaml
 
 # Verify
